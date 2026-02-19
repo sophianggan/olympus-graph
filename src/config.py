@@ -22,6 +22,11 @@ NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 
+# ── Groq / LLM Provider ───────────────────────────────
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq").lower()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
 # ── Embeddings ────────────────────────────────────────
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "384"))
@@ -42,8 +47,8 @@ GNN_EPOCHS = 100
 GNN_BATCH_SIZE = 1024
 
 # ── Training Splits ──────────────────────────────────
-TRAIN_YEARS = range(1896, 2021)  # 1896–2020 inclusive
-TEST_YEAR = 2024
+TRAIN_YEARS = range(1896, 2016)  # 1896–2015 inclusive
+TEST_YEAR = 2016
 
 # ── Recall@K ─────────────────────────────────────────
 RECALL_K = 3

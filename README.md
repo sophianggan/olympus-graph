@@ -65,8 +65,10 @@ pip install -r requirements.txt
 ### 3. Configuration
 ```bash
 cp .env.example .env
-# Edit .env with your Neo4j and OpenAI credentials
+# Edit .env with your Neo4j and Groq credentials
 ```
+
+Default LLM provider is Groq (`LLM_PROVIDER=groq`).
 
 ### 4. Start Neo4j (Docker)
 ```bash
@@ -112,12 +114,12 @@ streamlit run src/app/dashboard.py
 
 ## Key Design Decisions
 
-- **Temporal Snapshots**: The graph supports "time-travel" — when predicting 2024 medals, the GNN never sees 2024 edges.
+- **Temporal Snapshots**: The graph supports "time-travel" — when predicting for a holdout year, the GNN never sees that year's edges.
 - **Heterogeneous Graph**: 4 node types (Athlete, Country, Event, Games) with typed edges.
 - **Event Embeddings**: `all-MiniLM-L6-v2` captures semantic similarity (e.g., "100m Sprint" ≈ "200m Sprint").
 - **Self-Correcting Agent**: LangGraph's Reflector node catches errors and rewrites queries automatically.
 
 ## Evaluation
 - **Metric**: Recall@3 — Did the actual Gold medalist appear in the model's top-3 predictions?
-- **Train**: Games 1896–2020
-- **Test**: Games 2024 (Hold-out)
+- **Train**: Games 1896–2015
+- **Test**: Games 2016 (Hold-out)

@@ -40,10 +40,7 @@ def recall_at_k(
     per_event = {}
 
     for event_id, gold_athlete in ground_truth.items():
-        if event_id not in predictions:
-            continue
-
-        top_k_athletes = [aid for aid, _ in predictions[event_id][:k]]
+        top_k_athletes = [aid for aid, _ in predictions.get(event_id, [])[:k]]
         hit = gold_athlete in top_k_athletes
         hits += int(hit)
         total += 1
@@ -63,6 +60,35 @@ def recall_at_k(
         "total": total,
         "per_event": per_event,
     }
+
+
+def build_candidate_pairs_from_competed_edges(
+    data,
+    athlete_id_map: dict[str, int],
+    event_id_map: dict[str, int],
+    target_event_ids: set[str],
+) -> list[tuple[str, str]]:
+    """
+    Restrict candidate predictions to athletes who competed in the target events
+    in the training snapshot. This avoids expensive all-pairs evaluation.
+    """
+    idx_to_athlete = {v: k for k, v in athlete_id_map.items()}
+    idx_to_event = {v: k for k, v in event_id_map.items()}
+
+    competed_ei = data["athlete", "competed_in", "event"].edge_index
+    pairs: set[tuple[str, str]] = set()
+
+    for i in range(competed_ei.size(1)):
+        a_idx = competed_ei[0, i].item()
+        e_idx = competed_ei[1, i].item()
+        event_id = idx_to_event.get(e_idx)
+        athlete_id = idx_to_athlete.get(a_idx)
+        if not event_id or not athlete_id:
+            continue
+        if event_id in target_event_ids:
+            pairs.add((athlete_id, event_id))
+
+    return list(pairs)
 
 
 def compute_predictions_per_event(
@@ -97,15 +123,33 @@ def compute_predictions_per_event(
     model.eval()
     with torch.no_grad():
         if candidate_pairs is not None:
-            # Evaluate specific pairs
+            # Evaluate candidate pairs, grouped by event for batched scoring.
+            by_event: dict[str, list[str]] = defaultdict(list)
             for athlete_id, event_id in candidate_pairs:
-                a_idx = athlete_id_map.get(athlete_id)
+                by_event[event_id].append(athlete_id)
+
+            for event_id, athlete_ids in by_event.items():
                 e_idx = event_id_map.get(event_id)
-                if a_idx is not None and e_idx is not None:
-                    a_emb = athlete_embs[a_idx].unsqueeze(0)
-                    e_emb = event_embs[e_idx].unsqueeze(0)
-                    prob = model.predict_link(a_emb, e_emb).item()
-                    predictions[event_id].append((athlete_id, prob))
+                if e_idx is None:
+                    continue
+
+                athlete_indices = [
+                    athlete_id_map[aid]
+                    for aid in set(athlete_ids)
+                    if aid in athlete_id_map
+                ]
+                if not athlete_indices:
+                    continue
+
+                a_idx_tensor = torch.tensor(athlete_indices, dtype=torch.long)
+                a_emb = athlete_embs[a_idx_tensor]
+                e_emb = event_embs[e_idx].unsqueeze(0).expand(a_emb.size(0), -1)
+                probs = model.predict_link(a_emb, e_emb)
+
+                for j, a_idx in enumerate(athlete_indices):
+                    athlete_id = idx_to_athlete.get(a_idx)
+                    if athlete_id is not None:
+                        predictions[event_id].append((athlete_id, probs[j].item()))
         else:
             # Evaluate all athletes for each event (expensive but complete)
             for e_idx in range(event_embs.size(0)):
@@ -189,15 +233,30 @@ def evaluate_model(
         split_info["train_maps"]["event"],
     )
 
+    if not gt:
+        results = recall_at_k({}, {}, k=k)
+        logger.warning(
+            "No Gold medal ground-truth edges found in test split; skipping prediction scoring."
+        )
+        logger.info(f"Recall@{k}: 0.0000 (0/0 events)")
+        return results
+
+    candidate_pairs = build_candidate_pairs_from_competed_edges(
+        data=data,
+        athlete_id_map=split_info["train_maps"]["athlete"],
+        event_id_map=split_info["train_maps"]["event"],
+        target_event_ids=set(gt.keys()),
+    )
+
     # Compute predictions for candidate pairs
-    # Use athletes who competed in each test event
+    # Restrict to athletes who previously competed in each target event.
     predictions = compute_predictions_per_event(
         athlete_embs=athlete_embs,
         event_embs=event_embs,
         model=model,
         athlete_id_map=split_info["train_maps"]["athlete"],
         event_id_map=split_info["train_maps"]["event"],
-        candidate_pairs=None,  # Evaluate all for thorough eval
+        candidate_pairs=candidate_pairs,
     )
 
     results = recall_at_k(predictions, gt, k=k)

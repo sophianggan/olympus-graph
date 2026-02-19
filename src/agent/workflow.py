@@ -21,8 +21,15 @@ from loguru import logger
 from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_openai import ChatOpenAI
+from langchain_groq import ChatGroq
 
-from src.config import OPENAI_API_KEY, OPENAI_MODEL
+from src.config import (
+    OPENAI_API_KEY,
+    OPENAI_MODEL,
+    LLM_PROVIDER,
+    GROQ_API_KEY,
+    GROQ_MODEL,
+)
 from src.agent.tools import (
     graph_query_tool,
     model_predict_tool,
@@ -50,16 +57,34 @@ class AgentState(TypedDict):
 # LLM Setup
 # ══════════════════════════════════════════════════════
 
-def get_llm() -> ChatOpenAI:
+def get_llm():
     """Initialize the LLM for the agent."""
-    if not OPENAI_API_KEY or OPENAI_API_KEY.startswith("sk-your-key-here"):
-        raise ValueError(
-            "OPENAI_API_KEY is not set. Add it to `.env` before using the LangGraph agent."
+    provider = LLM_PROVIDER.strip().lower()
+
+    if provider == "groq":
+        if not GROQ_API_KEY or GROQ_API_KEY.startswith("gsk-your-key-here"):
+            raise ValueError(
+                "GROQ_API_KEY is not set. Add it to `.env` before using the LangGraph agent."
+            )
+        return ChatGroq(
+            model=GROQ_MODEL,
+            api_key=GROQ_API_KEY,
+            temperature=0.1,
         )
-    return ChatOpenAI(
-        model=OPENAI_MODEL,
-        api_key=OPENAI_API_KEY,
-        temperature=0.1,
+
+    if provider == "openai":
+        if not OPENAI_API_KEY or OPENAI_API_KEY.startswith("sk-your-key-here"):
+            raise ValueError(
+                "OPENAI_API_KEY is not set. Add it to `.env` before using the LangGraph agent."
+            )
+        return ChatOpenAI(
+            model=OPENAI_MODEL,
+            api_key=OPENAI_API_KEY,
+            temperature=0.1,
+        )
+
+    raise ValueError(
+        f"Unsupported LLM_PROVIDER='{LLM_PROVIDER}'. Use 'groq' or 'openai'."
     )
 
 

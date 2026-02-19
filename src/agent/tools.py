@@ -150,12 +150,38 @@ def model_predict_tool(
                 "error": "Event not found in model's index.",
             }
 
-        # Score all athletes against this event
-        e_emb = event_embs[event_idx].unsqueeze(0).expand(athlete_embs.size(0), -1)
-        scores = model.predict_link(athlete_embs, e_emb)
+        # Candidate filtering:
+        # 1) must have historical participation in this event
+        # 2) plausible competitive age at target year (14-45)
+        candidates = get_candidates_for_event(matched_event_id, max_year=target_year)
+        candidate_indices = []
+        for candidate in candidates:
+            athlete_id = candidate.get("athlete_id")
+            if not athlete_id:
+                continue
+            idx = id_maps["athlete"].get(athlete_id)
+            if idx is None:
+                continue
 
-        # Get top-K
-        top_values, top_indices = torch.topk(scores, min(top_k, scores.size(0)))
+            birth_year = candidate.get("birth_year")
+            if birth_year is None:
+                continue
+            age_at_target = target_year - int(birth_year)
+            if 14 <= age_at_target <= 45:
+                candidate_indices.append(idx)
+
+        # Fallback: if filtering removed everything, use all athletes.
+        if candidate_indices:
+            candidate_tensor = torch.tensor(sorted(set(candidate_indices)), dtype=torch.long)
+            athlete_pool = athlete_embs[candidate_tensor]
+            e_emb = event_embs[event_idx].unsqueeze(0).expand(athlete_pool.size(0), -1)
+            scores = model.predict_link(athlete_pool, e_emb)
+            top_values, top_local_indices = torch.topk(scores, min(top_k, scores.size(0)))
+            top_indices = candidate_tensor[top_local_indices]
+        else:
+            e_emb = event_embs[event_idx].unsqueeze(0).expand(athlete_embs.size(0), -1)
+            scores = model.predict_link(athlete_embs, e_emb)
+            top_values, top_indices = torch.topk(scores, min(top_k, scores.size(0)))
 
         idx_to_athlete = {v: k for k, v in id_maps["athlete"].items()}
 

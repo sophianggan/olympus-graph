@@ -16,6 +16,8 @@ import streamlit as st
 from pyvis.network import Network
 import tempfile
 import os
+import sys
+from pathlib import Path
 
 # Must be first Streamlit command
 st.set_page_config(
@@ -27,6 +29,11 @@ st.set_page_config(
 
 
 # ── Imports (after page config) ──────────────────────
+
+# Ensure the project root is importable when Streamlit runs this file directly.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.agent.workflow import ask
 from src.agent.tools import graph_query_tool, model_predict_tool
