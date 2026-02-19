@@ -32,11 +32,12 @@ from src.config import GNN_HIDDEN_DIM, GNN_NUM_LAYERS, GNN_DROPOUT, EMBEDDING_DI
 class AthleteEncoder(nn.Module):
     """
     Encode athlete features into a fixed-dim vector.
-    Input features: [avg_performance_norm, max_performance_norm, age_norm,
-                     height_norm, weight_norm, num_games_norm, sex_binary]
+    Input features:
+      [avg_perf_norm, max_perf_norm, num_participations_norm, num_games_norm,
+       age_norm, height_norm, weight_norm, sex_binary, last_year_norm]
     """
 
-    def __init__(self, in_dim: int = 7, hidden_dim: int = GNN_HIDDEN_DIM):
+    def __init__(self, in_dim: int = 9, hidden_dim: int = GNN_HIDDEN_DIM):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
@@ -187,14 +188,33 @@ class OlympusHeteroGNN(nn.Module):
 
         # Message passing
         for i, conv in enumerate(self.convs):
-            x_dict = conv(x_dict, data.edge_index_dict)
-            if i < self.num_layers - 1:
-                x_dict = {
-                    key: F.relu(F.dropout(x, p=self.dropout, training=self.training))
-                    for key, x in x_dict.items()
-                }
+            prev_x = x_dict
+            conv_out = conv(x_dict, data.edge_index_dict)
+
+            updated = {}
+            for key, x in conv_out.items():
+                if i < self.num_layers - 1:
+                    x = F.relu(F.dropout(x, p=self.dropout, training=self.training))
+
+                # Residual connection helps preserve node-specific signals
+                # and reduces over-smoothing collapse.
+                if key in prev_x and prev_x[key].shape == x.shape:
+                    x = x + prev_x[key]
+
+                updated[key] = x
+
+            x_dict = updated
 
         return x_dict
+
+    def predict_link_logits(
+        self,
+        athlete_emb: torch.Tensor,
+        event_emb: torch.Tensor,
+    ) -> torch.Tensor:
+        """Predict raw WON_MEDAL logits between athlete(s) and event(s)."""
+        combined = torch.cat([athlete_emb, event_emb], dim=-1)
+        return self.link_predictor(combined).squeeze(-1)
 
     def predict_link(
         self,
@@ -211,8 +231,7 @@ class OlympusHeteroGNN(nn.Module):
         Returns:
             (N,) probabilities
         """
-        combined = torch.cat([athlete_emb, event_emb], dim=-1)
-        logits = self.link_predictor(combined).squeeze(-1)
+        logits = self.predict_link_logits(athlete_emb, event_emb)
         return torch.sigmoid(logits)
 
     def compute_loss(
@@ -237,22 +256,22 @@ class OlympusHeteroGNN(nn.Module):
         # Positive edges
         pos_athlete_emb = x_dict["athlete"][pos_edge_index[0]]
         pos_event_emb = x_dict["event"][pos_edge_index[1]]
-        pos_pred = self.predict_link(pos_athlete_emb, pos_event_emb)
+        pos_logits = self.predict_link_logits(pos_athlete_emb, pos_event_emb)
 
         # Negative edges
         neg_athlete_emb = x_dict["athlete"][neg_edge_index[0]]
         neg_event_emb = x_dict["event"][neg_edge_index[1]]
-        neg_pred = self.predict_link(neg_athlete_emb, neg_event_emb)
+        neg_logits = self.predict_link_logits(neg_athlete_emb, neg_event_emb)
 
         # Labels
-        pos_labels = torch.ones_like(pos_pred)
-        neg_labels = torch.zeros_like(neg_pred)
+        pos_labels = torch.ones_like(pos_logits)
+        neg_labels = torch.zeros_like(neg_logits)
 
         # Combine
-        all_pred = torch.cat([pos_pred, neg_pred])
+        all_logits = torch.cat([pos_logits, neg_logits])
         all_labels = torch.cat([pos_labels, neg_labels])
 
-        return F.binary_cross_entropy(all_pred, all_labels)
+        return F.binary_cross_entropy_with_logits(all_logits, all_labels)
 
 
 # ── Factory Function ─────────────────────────────────

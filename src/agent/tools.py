@@ -10,6 +10,8 @@ Tools:
 from __future__ import annotations
 
 import json
+import re
+from functools import lru_cache
 from typing import Any
 from loguru import logger
 
@@ -19,6 +21,143 @@ from src.graph.snapshot import (
     get_athlete_neighborhood,
     get_target_year_edges,
 )
+
+_SNAPSHOT_CACHE: dict[tuple[int, str | None], tuple[Any, dict[str, dict[str, int]]]] = {}
+_MODEL_CACHE = None
+_ATHLETE_DETAILS_CACHE: dict[str, dict[str, Any]] = {}
+
+_EVENT_STOPWORDS = {
+    "the",
+    "a",
+    "an",
+    "who",
+    "will",
+    "win",
+    "winner",
+    "predict",
+    "prediction",
+    "for",
+    "in",
+    "of",
+    "olympics",
+    "olympic",
+    "event",
+}
+
+
+def _normalize_event_text(text: str) -> str:
+    """Normalize free-text event queries and event names for robust matching."""
+    value = (text or "").lower()
+    value = value.replace("’", "'").replace("`", "'")
+    value = re.sub(r"\b(\d{2,4})\s*m\b", r"\1 metres", value)
+    value = re.sub(r"\b(\d{2,4})m\b", r"\1 metres", value)
+    value = value.replace("meter", "metre")
+    value = value.replace("metreses", "metres")
+    value = re.sub(r"[^a-z0-9\s]", " ", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+
+def _is_track_sprint_query(normalized_query: str) -> bool:
+    """Heuristic: short sprint track event where users commonly write 100m/200m."""
+    if "metres" not in normalized_query:
+        return False
+    has_distance = any(distance in normalized_query for distance in ("100", "200", "400"))
+    has_swim_terms = any(
+        term in normalized_query
+        for term in ("swimming", "freestyle", "backstroke", "breaststroke", "butterfly")
+    )
+    return has_distance and not has_swim_terms
+
+
+@lru_cache(maxsize=1)
+def _get_event_catalog() -> list[dict[str, Any]]:
+    """Load all events once for fuzzy matching."""
+    return run_cypher(
+        """
+        MATCH (e:Event)
+        RETURN e.event_id AS event_id, e.event AS event, e.sport AS sport
+        """
+    )
+
+
+def _find_best_event_match(event_name: str) -> dict[str, Any] | None:
+    """Return the best matching event row for a user-provided event name."""
+    normalized_query = _normalize_event_text(event_name)
+    query_tokens = {
+        token for token in normalized_query.split() if token not in _EVENT_STOPWORDS
+    }
+    if not query_tokens:
+        return None
+
+    best_row = None
+    best_score = -1
+
+    for row in _get_event_catalog():
+        event_blob = f"{row.get('sport', '')} {row.get('event', '')} {row.get('event_id', '')}"
+        normalized_event = _normalize_event_text(event_blob)
+        event_tokens = set(normalized_event.split())
+
+        score = 0
+        if normalized_query and normalized_query in normalized_event:
+            score += 12
+
+        overlap = len(query_tokens & event_tokens)
+        score += overlap * 3
+
+        sport = str(row.get("sport", "")).lower()
+        if "athletics" in query_tokens and sport == "athletics":
+            score += 4
+        if "swimming" in query_tokens and sport == "swimming":
+            score += 4
+        if _is_track_sprint_query(normalized_query) and sport == "athletics":
+            score += 5
+
+        if "men" in query_tokens and "men" in event_tokens:
+            score += 2
+        if "women" in query_tokens and "women" in event_tokens:
+            score += 2
+
+        if score > best_score:
+            best_score = score
+            best_row = row
+
+    # Avoid random bad matches when overlap is weak.
+    return best_row if best_score >= 4 else None
+
+
+def _get_cached_model():
+    """Load trained model once per process."""
+    global _MODEL_CACHE
+    if _MODEL_CACHE is None:
+        from src.model.train import load_model
+
+        _MODEL_CACHE = load_model()
+    return _MODEL_CACHE
+
+
+def _get_cached_snapshot(target_year: int, host_noc: str | None):
+    """Build and cache the hetero snapshot per target year."""
+    key = (target_year, host_noc)
+    if key not in _SNAPSHOT_CACHE:
+        from src.model.dataset import build_hetero_data
+
+        _SNAPSHOT_CACHE[key] = build_hetero_data(max_year=target_year, host_noc=host_noc)
+    return _SNAPSHOT_CACHE[key]
+
+
+def _get_cached_athlete_details(athlete_id: str) -> dict[str, Any]:
+    """Cache athlete detail lookups used in prediction formatting."""
+    if athlete_id not in _ATHLETE_DETAILS_CACHE:
+        details = run_cypher(
+            """
+            MATCH (a:Athlete {athlete_id: $aid})-[:REPRESENTS]->(c:Country)
+            RETURN a.name AS name, a.birth_year AS birth_year, c.noc AS country
+            """,
+            {"aid": athlete_id},
+        )
+        _ATHLETE_DETAILS_CACHE[athlete_id] = details[0] if details else {}
+    return _ATHLETE_DETAILS_CACHE[athlete_id]
 
 
 # ══════════════════════════════════════════════════════
@@ -100,25 +239,13 @@ def model_predict_tool(
     """
     try:
         import torch
-        from src.model.train import load_model
-        from src.model.dataset import build_hetero_data
         from src.graph.preprocess import HOST_COUNTRY_MAP
 
         host_noc = HOST_COUNTRY_MAP.get(target_year)
 
-        # Find matching event(s)
-        event_search = run_cypher(
-            """
-            MATCH (e:Event)
-            WHERE toLower(e.event) CONTAINS toLower($search)
-               OR toLower(e.event_id) CONTAINS toLower($search)
-            RETURN e.event_id AS event_id, e.event AS event
-            LIMIT 5
-            """,
-            {"search": event_name},
-        )
-
-        if not event_search:
+        # Find best matching event using normalized fuzzy matching.
+        matched_event = _find_best_event_match(event_name)
+        if not matched_event:
             return {
                 "success": False,
                 "predictions": [],
@@ -126,12 +253,12 @@ def model_predict_tool(
                 "error": f"No event matching '{event_name}' found in the graph.",
             }
 
-        matched_event_id = event_search[0]["event_id"]
-        matched_event_name = event_search[0]["event"]
+        matched_event_id = matched_event["event_id"]
+        matched_event_name = matched_event["event"]
 
-        # Build snapshot and load model
-        data, id_maps = build_hetero_data(max_year=target_year, host_noc=host_noc)
-        model = load_model()
+        # Build snapshot and load model (cached to avoid repeated heavy rebuilds).
+        data, id_maps = _get_cached_snapshot(target_year=target_year, host_noc=host_noc)
+        model = _get_cached_model()
 
         # Get embeddings
         model.eval()
@@ -154,7 +281,14 @@ def model_predict_tool(
         # 1) must have historical participation in this event
         # 2) plausible competitive age at target year (14-45)
         candidates = get_candidates_for_event(matched_event_id, max_year=target_year)
-        candidate_indices = []
+        strict_indices = []
+        relaxed_indices = []
+
+        min_age = 14
+        strict_max_age = 40
+        relaxed_max_age = 45
+        max_inactive_years = 12
+
         for candidate in candidates:
             athlete_id = candidate.get("athlete_id")
             if not athlete_id:
@@ -167,40 +301,47 @@ def model_predict_tool(
             if birth_year is None:
                 continue
             age_at_target = target_year - int(birth_year)
-            if 14 <= age_at_target <= 45:
-                candidate_indices.append(idx)
+            if not (min_age <= age_at_target <= relaxed_max_age):
+                continue
+
+            relaxed_indices.append(idx)
+
+            last_year = candidate.get("last_year")
+            if last_year is None:
+                continue
+            years_since_last_games = target_year - int(last_year)
+            if min_age <= age_at_target <= strict_max_age and years_since_last_games <= max_inactive_years:
+                strict_indices.append(idx)
+
+        candidate_indices = strict_indices if len(strict_indices) >= top_k else relaxed_indices
 
         # Fallback: if filtering removed everything, use all athletes.
+        # Score a wider pool than top_k so deduping still leaves enough rows.
         if candidate_indices:
             candidate_tensor = torch.tensor(sorted(set(candidate_indices)), dtype=torch.long)
             athlete_pool = athlete_embs[candidate_tensor]
             e_emb = event_embs[event_idx].unsqueeze(0).expand(athlete_pool.size(0), -1)
             scores = model.predict_link(athlete_pool, e_emb)
-            top_values, top_local_indices = torch.topk(scores, min(top_k, scores.size(0)))
-            top_indices = candidate_tensor[top_local_indices]
+            candidate_limit = min(max(top_k * 8, top_k + 5), scores.size(0))
+            selected_scores, top_local_indices = torch.topk(scores, candidate_limit)
+            selected_indices = candidate_tensor[top_local_indices]
         else:
             e_emb = event_embs[event_idx].unsqueeze(0).expand(athlete_embs.size(0), -1)
             scores = model.predict_link(athlete_embs, e_emb)
-            top_values, top_indices = torch.topk(scores, min(top_k, scores.size(0)))
+            candidate_limit = min(max(top_k * 8, top_k + 5), scores.size(0))
+            selected_scores, selected_indices = torch.topk(scores, candidate_limit)
 
         idx_to_athlete = {v: k for k, v in id_maps["athlete"].items()}
 
         predictions = []
-        for i in range(top_values.size(0)):
-            a_idx = top_indices[i].item()
+        for i in range(selected_scores.size(0)):
+            a_idx = selected_indices[i].item()
             a_id = idx_to_athlete.get(a_idx, "Unknown")
 
-            # Fetch athlete details
-            details = run_cypher(
-                """
-                MATCH (a:Athlete {athlete_id: $aid})-[:REPRESENTS]->(c:Country)
-                RETURN a.name AS name, a.birth_year AS birth_year, c.noc AS country
-                """,
-                {"aid": a_id},
-            )
-            name = details[0]["name"] if details else a_id.split(" | ")[0]
-            country = details[0]["country"] if details else "N/A"
-            birth_year = details[0].get("birth_year", 0) if details else 0
+            details = _get_cached_athlete_details(a_id)
+            name = details.get("name", a_id)
+            country = details.get("country", "N/A")
+            birth_year = details.get("birth_year", 0)
 
             predictions.append({
                 "rank": i + 1,
@@ -208,8 +349,25 @@ def model_predict_tool(
                 "name": name,
                 "country": country,
                 "age_at_games": target_year - birth_year if birth_year else None,
-                "probability": round(top_values[i].item(), 4),
+                "probability": round(selected_scores[i].item(), 4),
             })
+
+        # Deduplicate by (name, country) and keep the highest probability variant.
+        dedup: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in predictions:
+            key = (str(row.get("name", "")).strip().lower(), str(row.get("country", "")))
+            existing = dedup.get(key)
+            if existing is None or row["probability"] > existing["probability"]:
+                dedup[key] = row
+
+        predictions = sorted(
+            dedup.values(),
+            key=lambda r: r["probability"],
+            reverse=True,
+        )[:top_k]
+
+        for i, row in enumerate(predictions, start=1):
+            row["rank"] = i
 
         logger.info(
             f"Predictions for {matched_event_name} ({target_year}): "

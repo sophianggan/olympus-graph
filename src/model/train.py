@@ -130,6 +130,7 @@ def train_model(
                 pos_ei,
                 num_athletes=data["athlete"].num_nodes,
                 num_events=data["event"].num_nodes,
+                competed_edge_index=data["athlete", "competed_in", "event"].edge_index,
             )
 
         loss = train_epoch(model, data, pos_ei, neg_ei, optimizer)
@@ -205,7 +206,13 @@ def load_model(
     metadata = ckpt["metadata"]
 
     model = build_model(metadata=metadata)
-    model.load_state_dict(ckpt["model_state_dict"])
+    try:
+        model.load_state_dict(ckpt["model_state_dict"])
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Checkpoint architecture mismatch. Retrain with "
+            "`python -m src.model.train` after updating model/data features."
+        ) from exc
     model.eval()
 
     logger.info(

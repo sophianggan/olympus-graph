@@ -42,10 +42,23 @@ def build_athlete_features(
 ) -> torch.Tensor:
     """
     Build athlete feature tensor.
-    Features: [avg_perf, max_perf, num_participations, num_games, age_norm, height_norm, sex]
+    Features:
+      [avg_perf_norm, max_perf_norm, num_participations_norm, num_games_norm,
+       age_norm, height_norm, weight_norm, sex_binary, last_year_norm]
     """
     n = len(id_map)
-    features = torch.zeros(n, 7)
+    features = torch.zeros(n, 9)
+
+    avg_vals = [float(a.get("avg_performance", 0) or 0) for a in athletes]
+    max_vals = [float(a.get("max_performance", 0) or 0) for a in athletes]
+    num_part_vals = [float(a.get("num_participations", 0) or 0) for a in athletes]
+    num_games_vals = [float(a.get("num_games", 0) or 0) for a in athletes]
+
+    max_avg = max(avg_vals) if avg_vals else 1.0
+    max_max = max(max_vals) if max_vals else 1.0
+    max_num_part = max(num_part_vals) if num_part_vals else 1.0
+    max_num_games = max(num_games_vals) if num_games_vals else 1.0
+    year_span = max(reference_year - 1896, 1)
 
     for a in athletes:
         idx = id_map.get(a["athlete_id"])
@@ -56,18 +69,27 @@ def build_athlete_features(
         max_perf = float(a.get("max_performance", 0) or 0)
         num_part = float(a.get("num_participations", 0) or 0)
         num_games = float(a.get("num_games", 0) or 0)
-        birth_year = float(a.get("birth_year", 1990) or 1990)
+        birth_year = float(a.get("birth_year", reference_year - 25) or (reference_year - 25))
         height = float(a.get("height", 175) or 175)
+        weight = float(a.get("weight", 72) or 72)
+        last_year = float(a.get("last_year", reference_year - 4) or (reference_year - 4))
         sex = 1.0 if a.get("sex") == "M" else 0.0
 
         # Rough age normalization relative to the current snapshot.
         age = (reference_year - 1) - birth_year
+        age_norm = max(0.0, min(age / 100.0, 1.0))
+        last_year_norm = max(0.0, min((last_year - 1896.0) / year_span, 1.0))
 
         features[idx] = torch.tensor([
-            avg_perf, max_perf, num_part, num_games,
-            age / 100.0,  # normalize to ~[0,1]
-            height / 220.0,  # normalize
+            avg_perf / max_avg if max_avg > 0 else 0.0,
+            max_perf / max_max if max_max > 0 else 0.0,
+            num_part / max_num_part if max_num_part > 0 else 0.0,
+            num_games / max_num_games if max_num_games > 0 else 0.0,
+            age_norm,
+            max(0.0, min(height / 220.0, 1.25)),
+            max(0.0, min(weight / 200.0, 1.25)),
             sex,
+            last_year_norm,
         ])
 
     return features
@@ -197,9 +219,14 @@ def sample_negative_edges(
     num_athletes: int,
     num_events: int,
     num_neg: int | None = None,
+    competed_edge_index: torch.Tensor | None = None,
+    hard_negative_ratio: float = 0.7,
 ) -> torch.Tensor:
     """
     Sample negative (Athlete, Event) pairs that are NOT in pos_edge_index.
+    Mixes:
+      1) hard negatives from COMPETED_IN but not WON_MEDAL
+      2) random negatives across athlete-event pairs
     Returns (2, num_neg) tensor.
     """
     if num_neg is None:
@@ -209,18 +236,41 @@ def sample_negative_edges(
     for i in range(pos_edge_index.size(1)):
         pos_set.add((pos_edge_index[0, i].item(), pos_edge_index[1, i].item()))
 
-    neg_src = []
-    neg_dst = []
+    selected_neg = set()
+    neg_src: list[int] = []
+    neg_dst: list[int] = []
+
+    # Hard negatives: athletes who competed in an event but did not medal in it.
+    if (
+        competed_edge_index is not None
+        and competed_edge_index.size(1) > 0
+        and hard_negative_ratio > 0
+    ):
+        hard_pool = []
+        for i in range(competed_edge_index.size(1)):
+            pair = (competed_edge_index[0, i].item(), competed_edge_index[1, i].item())
+            if pair not in pos_set:
+                hard_pool.append(pair)
+
+        np.random.shuffle(hard_pool)
+        hard_target = min(int(num_neg * hard_negative_ratio), len(hard_pool))
+        for s, d in hard_pool[:hard_target]:
+            if (s, d) in selected_neg:
+                continue
+            selected_neg.add((s, d))
+            neg_src.append(s)
+            neg_dst.append(d)
+
     attempts = 0
-    max_attempts = num_neg * 10
+    max_attempts = max(num_neg * 20, 10000)
 
     while len(neg_src) < num_neg and attempts < max_attempts:
         s = np.random.randint(0, num_athletes)
         d = np.random.randint(0, num_events)
-        if (s, d) not in pos_set:
+        if (s, d) not in pos_set and (s, d) not in selected_neg:
             neg_src.append(s)
             neg_dst.append(d)
-            pos_set.add((s, d))  # Avoid duplicates
+            selected_neg.add((s, d))
         attempts += 1
 
     return torch.tensor([neg_src, neg_dst], dtype=torch.long)
@@ -370,6 +420,7 @@ def build_train_test_split(
         train_pos_ei,
         num_athletes=train_data["athlete"].num_nodes,
         num_events=train_data["event"].num_nodes,
+        competed_edge_index=train_data["athlete", "competed_in", "event"].edge_index,
     )
 
     logger.info(

@@ -68,9 +68,13 @@ def load_and_clean_data() -> pd.DataFrame:
     df["year"] = df["year"].astype(int)
 
     # Create composite IDs
-    # Athlete ID: Name + Age approximation (year - age -> birth year)
+    # Athlete ID: use Kaggle's stable athlete ID when available.
+    # Fallback to name+birth_year only if the source column is missing.
     df["birth_year"] = df["year"] - df["age"].fillna(0).astype(int)
-    df["athlete_id"] = df["name"] + " | " + df["birth_year"].astype(str)
+    if "id" in df.columns:
+        df["athlete_id"] = df["id"].astype(int).astype(str)
+    else:
+        df["athlete_id"] = df["name"] + " | " + df["birth_year"].astype(str)
 
     # Event ID: Sport + Event Name
     df["event_id"] = df["sport"] + " | " + df["event"]

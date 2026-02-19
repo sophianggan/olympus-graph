@@ -30,6 +30,9 @@ data/processed/checkpoints/
 .DS_Store
 Thumbs.db
 
+# Runtime-generated UI assets
+lib/
+
 # Model checkpoints
 *.pt
 *.pth

@@ -263,16 +263,27 @@ def reflector_node(state: AgentState) -> dict:
     retry = state.get("retry_count", 0)
 
     if result.get("success"):
-        # Check for empty results
-        data = result.get("data", [])
-        if isinstance(data, list) and len(data) == 0:
-            if retry < MAX_RETRIES:
+        query_type = state.get("query_type", "")
+
+        if query_type == "historical":
+            data = result.get("data", [])
+            if isinstance(data, list) and len(data) == 0 and retry < MAX_RETRIES:
                 logger.warning("Empty results, asking Generator to rewrite")
                 return {
                     "error_message": "The query returned empty results. Try broadening the search or using different filters.",
                     "retry_count": retry + 1,
                 }
-        # Success — clear error
+
+        if query_type == "prediction":
+            predictions = result.get("predictions", [])
+            if isinstance(predictions, list) and len(predictions) == 0 and retry < MAX_RETRIES:
+                logger.warning("Empty prediction list, asking Generator to rewrite")
+                return {
+                    "error_message": "Prediction produced no candidates. Try a different event wording.",
+                    "retry_count": retry + 1,
+                }
+
+        # Success — clear error and continue to answer.
         return {"error_message": "", "retry_count": retry}
 
     # Execution failed
