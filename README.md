@@ -193,14 +193,6 @@ Example prompts:
 - `Who will win the Men's 100m in 2028?`
 - `Show me Usain Bolt's Olympic history`
 
-## Re-generate all README figures
-
-```bash
-python3 scripts/generate_readme_figures.py
-```
-
-Outputs go to `docs/figures/`.
-
 ## Repository layout
 
 ```text
