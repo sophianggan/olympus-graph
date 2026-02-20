@@ -3,8 +3,8 @@ Olympus Graph – GNN Training Loop
 Trains the Heterogeneous GraphSAGE/GATv2 for WON_MEDAL link prediction.
 
 Training Strategy:
-  - Train: Games 1896–2020 (all data before 2024)
-  - Test:  Games 2024 (hold-out)
+  - Train: Games before TEST_YEAR (from src.config)
+  - Test:  TEST_YEAR hold-out (from src.config)
   - Loss:  Binary Cross Entropy (edge existence)
   - Metric: Recall@3
 """
@@ -77,7 +77,7 @@ def train_model(
     epochs: int = GNN_EPOCHS,
     lr: float = GNN_LEARNING_RATE,
     eval_every: int = 10,
-    host_noc: str | None = "FRA",  # 2024 host
+    host_noc: str | None = None,
 ) -> tuple[OlympusHeteroGNN, dict]:
     """
     Full training pipeline.
@@ -98,7 +98,7 @@ def train_model(
 
     # ── Build dataset ─────────────────────────────
     split_info = build_train_test_split(
-        train_max_year=max(TRAIN_YEARS) + 1,  # 2021 → sees up to 2020
+        train_max_year=max(TRAIN_YEARS) + 1,  # sees edges with year < train_max_year
         test_year=TEST_YEAR,
         host_noc=host_noc,
     )
